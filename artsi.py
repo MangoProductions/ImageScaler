@@ -27,11 +27,13 @@ def edge_aware_sharpen(image: np.ndarray, strength: float = 0.5, radius: int = 2
         edges = np.abs(edges)
         edges = cv2.GaussianBlur(edges, (0, 0), sigmaX=radius)
         edges = cv2.normalize(edges, None, 0, 1, cv2.NORM_MINMAX)
-
+        
+        #???
         contrast = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
         contrast = np.abs(contrast)
         contrast = cv2.GaussianBlur(contrast, (0, 0), sigmaX=radius)
         contrast = cv2.normalize(contrast, None, 0, 1, cv2.NORM_MINMAX)
+        #What was the idea?
 
         kernel = np.array([
             [-1, -1, -1],
