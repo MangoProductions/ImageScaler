@@ -27,19 +27,17 @@ def edge_aware_sharpen(image: np.ndarray, strength: float = 0.5, radius: int = 2
         edges = np.abs(edges)
         edges = cv2.GaussianBlur(edges, (0, 0), sigmaX=radius)
         edges = cv2.normalize(edges, None, 0, 1, cv2.NORM_MINMAX)
-        
-        #???
-        contrast = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
-        contrast = np.abs(contrast)
-        contrast = cv2.GaussianBlur(contrast, (0, 0), sigmaX=radius)
+
+        #Fixed the Contrast
+        blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=radius * 2)
+        contrast = np.abs(gray - blur)
         contrast = cv2.normalize(contrast, None, 0, 1, cv2.NORM_MINMAX)
-        #What was the idea?
 
         kernel = np.array([
             [-1, -1, -1],
             [-1,  8, -1],
             [-1, -1, -1]
-        ], dtype=np.float32) / 8.0
+        ], dtype=np.float32) /2
 
         sharpened = cv2.filter2D(img, -1, kernel)
         sharpened = np.clip(sharpened, 0, 1)
@@ -55,56 +53,66 @@ def edge_aware_sharpen(image: np.ndarray, strength: float = 0.5, radius: int = 2
         return image
 
 
-
-
-
-
-
-def add_film_grain_gradient(image: np.ndarray) -> np.ndarray:
+def add_grain(image: np.ndarray, grain_alpha: float = 0.3) -> np.ndarray:
     if image is None or image.size == 0:
-        print("add_film_grain_gradient: input image is empty!")
-        return image
-    try:
-        # Film Grain meh.
-        h, w = image.shape[:2]
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        brightness_map = cv2.GaussianBlur(gray, (0, 0), 25)
-        brightness_norm = brightness_map / 255.0
-        large_w = np.clip((122 - brightness_map) / 122.0, 0, 1)
-        medium_w = np.clip((brightness_map - 122) / (255 - 122), 0, 1) * (1 - large_w)
-        small_w = 1.0 - large_w - medium_w
-        large_noise = np.random.normal(0, 1.0, (h//16, w//16, 3))
-        med_noise = np.random.normal(0, 0.5, (h//32, w//32, 3))
-        small_noise = np.random.normal(0, 0.25, (h//48, w//48, 3))
-        large_noise = cv2.resize(large_noise, (w, h), interpolation=cv2.INTER_LINEAR)
-        med_noise = cv2.resize(med_noise, (w, h), interpolation=cv2.INTER_LINEAR)
-        small_noise = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_LINEAR)
-        grain = (
-            large_noise * large_w[..., None] +
-            med_noise * medium_w[..., None] +
-            small_noise * small_w[..., None]
-        )
-        edges = cv2.Laplacian(gray, cv2.CV_32F)
-        edges = np.abs(edges)
-        edges = cv2.GaussianBlur(edges, (0, 0), 7)
-        edges_norm = cv2.normalize(edges, None, 0, 1.0, cv2.NORM_MINMAX)
-        grain_strength = 1.0 - edges_norm[..., None]
-        grain *= grain_strength
-        color_shifts = np.random.randint(-3, 4, (h//4, w//4, 3))
-        color_shifts = cv2.resize(color_shifts, (w, h), interpolation=cv2.INTER_NEAREST)
-        grain += color_shifts
-        grain = cv2.GaussianBlur(grain, (0, 0), 0.8)
-        output = image.astype(np.float32) + grain
-        output = np.clip(output, 0, 255).astype(np.uint8)
-        return output
-    except Exception as e:
-        print(f"add_film_grain_gradient error: {e}")
         return image
 
+    h, w = image.shape[:2]
+    img = image.astype(np.float32)
 
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lum = gray / 255.0
+    mid = 0.5
 
+    w_dark = np.clip(1.0 - lum / mid, 0, 1) ** 1.5
+    w_bright = np.clip((lum - mid) / (1.0 - mid), 0, 1) ** 1.5
+    w_mid = (1.0 - w_dark) * (1.0 - w_bright)
 
+    large = np.random.randn(h, w)
+    large = cv2.GaussianBlur(large, (0, 0), 2.5)
+    small = cv2.resize(large, (w//12, h//12), interpolation=cv2.INTER_LINEAR)
+    large = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    large = np.repeat(large[:, :, None], 3, axis=2)
 
+    medium = np.random.randn(h, w)
+    medium = cv2.GaussianBlur(medium, (0, 0), 1.0)
+    tmp = cv2.resize(medium, (w//3, h//3), interpolation=cv2.INTER_LINEAR)
+    medium = cv2.resize(tmp, (w, h), interpolation=cv2.INTER_LINEAR)
+    medium = np.repeat(medium[:, :, None], 3, axis=2)
+
+    fine = np.random.randn(h, w)
+    fine = fine - cv2.GaussianBlur(fine, (0, 0), 0.3)
+    fine = np.repeat(fine[:, :, None], 3, axis=2)
+
+    grain = (
+        large * w_dark[..., None] * 12.0 +
+        medium * w_mid[..., None] * 8.0 +
+        fine * w_bright[..., None] * 6.0
+    )
+
+    r_noise = np.random.randn(h, w) * 25.0
+    g_noise = np.random.randn(h, w) * 25.0
+    b_noise = np.random.randn(h, w) * 25.0
+    r_noise *= w_dark + 0.3 * w_mid + 0.1 * w_bright
+    g_noise *= w_dark + 0.3 * w_mid + 0.1 * w_bright
+    b_noise *= w_dark + 0.3 * w_mid + 0.1 * w_bright
+
+    color_grain = np.stack([b_noise, g_noise, r_noise], axis=2)
+    grain += color_grain
+
+    specks = (np.random.rand(h, w) > 0.995).astype(np.float32)
+    color_specks = np.random.randint(-50, 50, (h, w, 3)).astype(np.float32)
+    grain += color_specks * specks[..., None]
+
+    grain -= np.mean(grain, axis=(0,1), keepdims=True)
+    grain /= (np.std(grain, axis=(0,1), keepdims=True) + 1e-6)
+
+    out = img + grain * grain_alpha * 50.0  # 50.0 = visual scaling factor
+
+    
+    out = (out - 128) * 1.01 + 128
+
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def generate_bloom_layer(image: np.ndarray) -> np.ndarray:
@@ -129,7 +137,13 @@ def generate_bloom_layer(image: np.ndarray) -> np.ndarray:
 
 
 
-
+def reduce_noise_bilateral(image: np.ndarray, diameter: int = 9, sigmaColor: float = 75, sigmaSpace: float = 75) -> np.ndarray:
+    #This reduces noise
+    #Why would I do this?
+    #I like the contradictory state.
+    if image is None or image.size == 0:
+        return image
+    return cv2.bilateralFilter(image, diameter, sigmaColor, sigmaSpace)
 
 
 
@@ -184,7 +198,7 @@ def add_thorium_speks(image: np.ndarray, count: int = 15) -> np.ndarray:
         print("add_thorium_speks: input image is empty!")
         return image
     try:
-        # Not happy with this code.
+        # Not happy with this spek code.
         img = image.copy()
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -251,39 +265,24 @@ def process_image(args: tuple) -> Optional[str]:
 
         upscaled = cv2.resize(img, upscaled_size, interpolation=cv2.INTER_LANCZOS4)
 
-        sharpened = edge_aware_sharpen(upscaled, strength=0.6, radius=2)
 
-        bloom_layer = generate_bloom_layer(sharpened)
+        bloom_layer = generate_bloom_layer(upscaled)
 
         #BLOOM ENCORE GO
         bloom_layer = apply_chromatic_aberration(bloom_layer)
 
-        bloomed = cv2.add(sharpened, bloom_layer)
+        bloomed = cv2.add(upscaled, bloom_layer)
 
-        grained = add_film_grain_gradient(bloomed)
 
         final_size = (
             int(base_w * FINAL_SCALE),
             int(base_h * FINAL_SCALE)
         )
 
-        final = cv2.resize(grained, final_size, interpolation=cv2.INTER_AREA)
-
-        gray = cv2.cvtColor(final, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Laplacian(gray, cv2.CV_32F)
-        edges = np.abs(edges)
-        edges = cv2.GaussianBlur(edges, (0, 0), 3)
-        edges_norm = cv2.normalize(edges, None, 0, 1.0, cv2.NORM_MINMAX)
-
-        mask = 1.0 - edges_norm
-        mask = np.clip(mask, 0, 1)
-
-        blurred = cv2.GaussianBlur(final, (0, 0), 0.5)
-        smooth_factor = 0.5
-        final_smooth = final.astype(np.float32) * (1 - mask * smooth_factor)[:, :, None] + blurred.astype(np.float32) * (mask * smooth_factor)[:, :, None]
-        final_smooth = np.clip(final_smooth, 0, 255).astype(np.uint8)
-
-        final = final_smooth
+        final = cv2.resize(bloomed, final_size, interpolation=cv2.INTER_AREA)
+        final = add_grain(final, grain_alpha=0.1)
+        final = reduce_noise_bilateral(final, diameter=9, sigmaColor=25, sigmaSpace=25)
+        final = edge_aware_sharpen(final, strength=4, radius=1)
         final = add_thorium_speks(final, count=12)
 
         new_name = f"photo{idx+1:03d}.jpg"
