@@ -79,7 +79,11 @@ CFG = EffectsConfig()
 INPUT_FOLDER = "input_images"
 OUTPUT_FOLDER = "output_images"
 
-Tile = Tuple[int, int, int, int, np.ndarray]
+Tile = Tuple[
+    int, int, int, int,
+    int, int, int, int,
+    np.ndarray
+]
 Image = np.ndarray
 
 
