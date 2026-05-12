@@ -69,6 +69,7 @@ class EffectsConfig:
     # Tile
     tiles_x: int = 2
     tiles_y: int = 2
+    tile_overlap: int = 20
 
     
 
@@ -114,7 +115,7 @@ def get_ca_maps(h: int, w: int, cfg: EffectsConfig) -> Tuple[np.ndarray, ...]:
         g_x.astype(np.float32),
         g_y.astype(np.float32),
     )
-
+    #Grandest shame of mine is not remembering the error I was receiving without this. I know it requires a cache to avoid ram getting eaten up. It was ticking up.
     _CA_CACHE[key] = maps
     return maps
 
@@ -242,17 +243,38 @@ def dither_blend(a: np.ndarray, b: np.ndarray, cfg: EffectsConfig) -> np.ndarray
 
 def split_tiles(img: np.ndarray, cfg: EffectsConfig) -> List[Tile]:
     h, w = img.shape[:2]
+
     tile_h = h // cfg.tiles_y
     tile_w = w // cfg.tiles_x
+    overlap = cfg.tile_overlap
 
     tiles = []
+
     for ty in range(cfg.tiles_y):
         for tx in range(cfg.tiles_x):
+
+            # Core region (final placement)
             y0 = ty * tile_h
             x0 = tx * tile_w
+
             y1 = (ty + 1) * tile_h if ty < cfg.tiles_y - 1 else h
             x1 = (tx + 1) * tile_w if tx < cfg.tiles_x - 1 else w
-            tiles.append((y0, y1, x0, x1, img[y0:y1, x0:x1]))
+
+            # Expanded sampling region
+            sy0 = max(0, y0 - overlap)
+            sx0 = max(0, x0 - overlap)
+
+            sy1 = min(h, y1 + overlap)
+            sx1 = min(w, x1 + overlap)
+
+            tile = img[sy0:sy1, sx0:sx1]
+
+            tiles.append((
+                y0, y1, x0, x1,   # destination region
+                sy0, sy1, sx0, sx1,  # sampled region
+                tile
+            ))
+
     return tiles
 
 def merge_tiles(base_img: np.ndarray, processed_tiles: List[Tile]) -> np.ndarray:
@@ -262,14 +284,32 @@ def merge_tiles(base_img: np.ndarray, processed_tiles: List[Tile]) -> np.ndarray
     return out
 
 
-def process_tile(tile: Tile, cfg: EffectsConfig) -> Tile:
-    y0, y1, x0, x1, img = tile
+def process_tile(tile, cfg: EffectsConfig):
+    (
+        y0, y1, x0, x1,
+        sy0, sy1, sx0, sx1,
+        img
+    ) = tile
+
+    overlap = cfg.tile_overlap
+    
     y, cr, cb = split_ycc(img)
     cr_p, cb_p = process_chroma(cr, cb, cfg)
     y_sharp = rcas_like_sharpen(y, cfg)
     merged = merge_ycc(y_sharp, cr_p, cb_p)
     sepia_merged = selective_sepia(merged, cfg)
     final_tile = dither_blend(merged, sepia_merged, cfg)
+
+    # Crop overlap away
+    crop_top = y0 - sy0
+    crop_left = x0 - sx0
+    crop_bottom = crop_top + (y1 - y0)
+    crop_right = crop_left + (x1 - x0)
+
+    final_tile = final_tile[
+        crop_top:crop_bottom,
+        crop_left:crop_right
+    ]
     return (y0, y1, x0, x1, final_tile)
 
 
