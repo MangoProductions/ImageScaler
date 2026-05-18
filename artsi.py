@@ -4,20 +4,18 @@ import numpy as np
 import time
 
 from multiprocessing import Pool
-from typing import List, Tuple, Optional
+from typing import Optional
 from dataclasses import dataclass
+
 
 @dataclass(frozen=True)
 class EffectsConfig:
+
     # Chromatic Aberration
     chromatic_aberration_strength: float = 0.002
     ca_shift: float = 1.5
 
     # Bloom
-    bloom_threshold: float = 0.7
-    bloom_scale: float = 0.3
-    bloom_sigma_small: float = 8
-    bloom_sigma_large: float = 16
     bloom_large_weight: float = 0.5
     bloom_highlight_threshold: float = 0.75
     bloom_highlight_range: float = 0.25
@@ -31,17 +29,13 @@ class EffectsConfig:
 
     # Sharpen
     sharpen_strength: float = 0.7
-    sharpen_sigma: float = 1.0
 
     # Contrast
     contrast_strength: float = 0.6
-    log_contrast_scale: float = 9.999
-    log_contrast_base: float = 10.0
 
-    # Chroma Processing
+    # Chroma
     chroma_resize_x: float = 0.25
     chroma_resize_y: float = 1.0
-    chroma_blur_sigma: float = 3.0
     chroma_blur_weight: float = 0.5
     chroma_contrast_boost: float = 0.5
     chroma_channel_balance_cr: float = 2.0
@@ -50,12 +44,15 @@ class EffectsConfig:
 
     # Sepia
     sepia_strength: float = 1.0
+
     sepia_red_coeff: float = 0.393
     sepia_green_coeff: float = 0.769
     sepia_blue_coeff: float = 0.189
+
     sepia_red_coeff_b: float = 0.272
     sepia_green_coeff_b: float = 0.534
     sepia_blue_coeff_b: float = 0.131
+
     sepia_red_coeff_g: float = 0.349
     sepia_green_coeff_g: float = 0.686
     sepia_blue_coeff_g: float = 0.168
@@ -64,12 +61,7 @@ class EffectsConfig:
     dither_amount: float = 0.5
 
     # JPEG
-    jpeg_quality: int = 95
-
-    # Tile
-    tiles_x: int = 2
-    tiles_y: int = 2
-    tile_overlap: int = 20
+    jpeg_quality: int = 90
 
 
 CFG = EffectsConfig()
@@ -77,18 +69,89 @@ CFG = EffectsConfig()
 INPUT_FOLDER = "input_images"
 OUTPUT_FOLDER = "output_images"
 
-Tile = Tuple[
-    int, int, int, int,
-    int, int, int, int,
-    np.ndarray
-]
-
-Image = np.ndarray
-
 _CA_CACHE = {}
 
-def get_ca_maps(h: int, w: int, cfg: EffectsConfig):
-    key = (h, w, cfg.chromatic_aberration_strength, cfg.ca_shift)
+GLOBAL_DARK_NOISE = None
+GLOBAL_MID_NOISE = None
+GLOBAL_BRIGHT_NOISE = None
+
+GLOBAL_DITHER = None
+
+NOISE_TILE_SIZE = 64
+DITHER_BLOCK = 4
+
+POOL: Optional[Pool] = None
+
+
+def init_noise(cfg):
+
+    global GLOBAL_DARK_NOISE
+    global GLOBAL_MID_NOISE
+    global GLOBAL_BRIGHT_NOISE
+
+    GLOBAL_DARK_NOISE = (
+        np.random.poisson(
+            lam=cfg.grain_poisson_lambda,
+            size=(
+                NOISE_TILE_SIZE,
+                NOISE_TILE_SIZE,
+                2
+            )
+        ).astype(np.float32)
+        - cfg.grain_poisson_lambda
+    ) / cfg.grain_poisson_divisor
+
+    GLOBAL_MID_NOISE = (
+        np.random.poisson(
+            lam=cfg.grain_poisson_lambda * 0.5,
+            size=(
+                NOISE_TILE_SIZE,
+                NOISE_TILE_SIZE,
+                2
+            )
+        ).astype(np.float32)
+        - (cfg.grain_poisson_lambda * 0.5)
+    ) / cfg.grain_poisson_divisor
+
+    GLOBAL_BRIGHT_NOISE = (
+        np.random.poisson(
+            lam=cfg.grain_poisson_lambda * 0.2,
+            size=(
+                NOISE_TILE_SIZE,
+                NOISE_TILE_SIZE,
+                2
+            )
+        ).astype(np.float32)
+        - (cfg.grain_poisson_lambda * 0.2)
+    ) / cfg.grain_poisson_divisor
+
+
+
+def init_dither(max_size=4096):
+
+    global GLOBAL_DITHER
+
+    y, x = np.indices((max_size, max_size))
+
+    GLOBAL_DITHER = (
+        (x + y) % 2
+    ).astype(np.uint8)
+
+
+def init_pool(processes: int):
+
+    global POOL
+    POOL = Pool(processes)
+
+
+def get_ca_maps(h, w, cfg):
+
+    key = (
+        h,
+        w,
+        cfg.chromatic_aberration_strength,
+        cfg.ca_shift
+    )
 
     if key in _CA_CACHE:
         return _CA_CACHE[key]
@@ -101,17 +164,41 @@ def get_ca_maps(h: int, w: int, cfg: EffectsConfig):
     y -= cy
 
     r = np.sqrt(x * x + y * y)
+
     r_norm = r / (r.max() + 1e-6)
+
     radial = r_norm ** 2
 
     base_x = x + cx
     base_y = y + cy
 
-    rb_x = base_x + x * radial * cfg.chromatic_aberration_strength * cfg.ca_shift
-    rb_y = base_y + y * radial * cfg.chromatic_aberration_strength * cfg.ca_shift
+    rb_x = (
+        base_x +
+        x * radial *
+        cfg.chromatic_aberration_strength *
+        cfg.ca_shift
+    )
 
-    g_x = base_x - x * radial * (cfg.chromatic_aberration_strength * 0.5) * cfg.ca_shift
-    g_y = base_y - y * radial * (cfg.chromatic_aberration_strength * 0.5) * cfg.ca_shift
+    rb_y = (
+        base_y +
+        y * radial *
+        cfg.chromatic_aberration_strength *
+        cfg.ca_shift
+    )
+
+    g_x = (
+        base_x -
+        x * radial *
+        (cfg.chromatic_aberration_strength * 0.5) *
+        cfg.ca_shift
+    )
+
+    g_y = (
+        base_y -
+        y * radial *
+        (cfg.chromatic_aberration_strength * 0.5) *
+        cfg.ca_shift
+    )
 
     maps = (
         rb_x.astype(np.float32),
@@ -121,113 +208,134 @@ def get_ca_maps(h: int, w: int, cfg: EffectsConfig):
     )
 
     _CA_CACHE[key] = maps
+
     return maps
 
 
-# YCbCr
-
 def split_ycc(img):
+
     ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+
     y, cr, cb = cv2.split(ycc)
+
     return y, cr, cb
 
 
 def merge_ycc(y, cr, cb):
+
     ycc = cv2.merge([y, cr, cb])
+
     return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
 
 
-# Main effects
-
 def apply_chromatic_aberration(image, cfg):
+
     h, w = image.shape[:2]
 
-    rb_x, rb_y, g_x, g_y = get_ca_maps(h, w, cfg)
+    small = cv2.resize(
+        image,
+        (w // 2, h // 2),
+        interpolation=cv2.INTER_AREA
+    )
 
-    b, g, r = cv2.split(image)
+    sh, sw = small.shape[:2]
+
+    rb_x, rb_y, g_x, g_y = get_ca_maps(
+        sh,
+        sw,
+        cfg
+    )
+
+    b, g, r = cv2.split(small)
 
     r = cv2.remap(r, rb_x, rb_y, cv2.INTER_LINEAR)
     b = cv2.remap(b, rb_x, rb_y, cv2.INTER_LINEAR)
     g = cv2.remap(g, g_x, g_y, cv2.INTER_LINEAR)
 
-    return cv2.merge([b, g, r])
+    merged = cv2.merge([b, g, r])
+
+    return cv2.resize(
+        merged,
+        (w, h),
+        interpolation=cv2.INTER_LINEAR
+    )
 
 
 def generate_bloom_layer(image, cfg):
 
-    if image is None or image.size == 0:
-        print("generate_bloom_layer: input image is empty!")
-        return image
+    h, w = image.shape[:2]
 
-    try:
-        img = image.astype(np.float32) / 255.0
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) / 255.0
-
-        mask = np.clip(
-            (gray - cfg.bloom_highlight_threshold) / cfg.bloom_highlight_range,
-            0,
-            1
-        )
-
-        highlights = img * mask[:, :, None]
-
-        bloom = cv2.GaussianBlur(
-            highlights,
-            (0, 0),
-            cfg.bloom_sigma_small
-        )
-
-        bloom += cv2.GaussianBlur(
-            highlights,
-            (0, 0),
-            cfg.bloom_sigma_large
-        ) * cfg.bloom_large_weight
-
-        bloom[:, :, 2] *= cfg.bloom_red_boost
-        bloom[:, :, 1] *= cfg.bloom_green_boost
-
-        bloom = np.clip(bloom, 0, 1)
-
-        return (bloom * 255).astype(np.uint8)
-
-    except Exception as e:
-        print(f"generate_bloom_layer error: {e}")
-        return image
-
-
-def digital_sensor_grain(img, cfg):
-    img_f = img.astype(np.float32)
-
-    lum = np.mean(img_f / 255.0, axis=2)
-    weight = (1.0 - lum)[:, :, None]
-
-    noise = (
-        np.random.poisson(
-            lam=cfg.grain_poisson_lambda,
-            size=img.shape
-        ).astype(np.float32) - cfg.grain_poisson_lambda
-    ) / cfg.grain_poisson_divisor
-
-    img_f += noise * 255 * cfg.grain_strength * weight
-
-    return np.clip(img_f, 0, 255).astype(np.uint8)
-
-
-def apply_log_contrast(img, cfg, invert=False):
-    img = img.astype(np.float32) / 255.0
-
-    img_log = (
-        np.log1p(img * cfg.log_contrast_scale) /
-        np.log(cfg.log_contrast_base)
+    small = cv2.resize(
+        image,
+        (w // 2, h // 2),
+        interpolation=cv2.INTER_AREA
     )
 
-    if invert:
-        img_log = 1.0 - img_log
+    img = small.astype(np.float32) / 255.0
 
-    img_log = img_log ** (1.0 / cfg.contrast_strength)
+    gray = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2GRAY
+    ) / 255.0
 
-    return (np.clip(img_log, 0, 1) * 255).astype(np.uint8)
+    mask = np.clip(
+        (
+            gray -
+            cfg.bloom_highlight_threshold
+        ) / cfg.bloom_highlight_range,
+        0,
+        1
+    )
+
+    highlights = img * mask[:, :, None]
+
+    
+    pyr1 = cv2.pyrDown(highlights)
+    pyr1 = cv2.pyrUp(cv2.pyrDown(pyr1))  # <-- Pyramid blur
+
+    
+    pyr2 = cv2.pyrDown(pyr1)
+    pyr2 = cv2.pyrUp(cv2.pyrDown(pyr2))  # <-- Pyramid blur
+    bloom_small = cv2.pyrUp(
+        pyr1,
+        dstsize=(
+            highlights.shape[1],
+            highlights.shape[0]
+        )
+    )
+
+    bloom_large = cv2.pyrUp(
+        cv2.pyrUp(
+            pyr2,
+            dstsize=(
+                pyr1.shape[1],
+                pyr1.shape[0]
+            )
+        ),
+        dstsize=(
+            highlights.shape[1],
+            highlights.shape[0]
+        )
+    )
+
+    bloom = (
+        bloom_small +
+        bloom_large *
+        cfg.bloom_large_weight
+    )
+
+    bloom[:, :, 2] *= cfg.bloom_red_boost
+    bloom[:, :, 1] *= cfg.bloom_green_boost
+
+    bloom = np.clip(bloom, 0, 1)
+
+    bloom = (bloom * 255).astype(np.uint8)
+
+    return cv2.resize(
+        bloom,
+        (w, h),
+        interpolation=cv2.INTER_LINEAR
+    )
 
 
 def rcas_like_sharpen(img, cfg):
@@ -243,7 +351,9 @@ def rcas_like_sharpen(img, cfg):
     sharpened = cv2.filter2D(img_f, -1, kernel)
 
     return np.clip(
-        img_f + (sharpened - img_f) * cfg.sharpen_strength,
+        img_f +
+        (sharpened - img_f) *
+        cfg.sharpen_strength,
         0,
         255
     ).astype(np.uint8)
@@ -266,10 +376,16 @@ def process_chroma(cr, cb, cfg):
         interpolation=cv2.INTER_AREA
     )
 
-    blur = cv2.GaussianBlur(
-        small,
-        (0, 0),
-        cfg.chroma_blur_sigma
+    
+    pyr = cv2.pyrDown(small)
+    pyr = cv2.pyrUp(cv2.pyrDown(pyr))  
+
+    blur = cv2.pyrUp(
+        pyr,
+        dstsize=(
+            small.shape[1],
+            small.shape[0]
+        )
     )
 
     small = small + blur * cfg.chroma_blur_weight
@@ -280,7 +396,54 @@ def process_chroma(cr, cb, cfg):
         cfg.chroma_contrast_boost
     )
 
-    noise = np.random.poisson(*small.shape).astype(np.float32)
+    lum = np.mean(
+        small + 128.0,
+        axis=2
+    ) / 255.0
+
+    sh, sw = small.shape[:2]
+
+    rep_y = sh // NOISE_TILE_SIZE + 1
+    rep_x = sw // NOISE_TILE_SIZE + 1
+
+    dark_noise = np.tile(
+        GLOBAL_DARK_NOISE,
+        (rep_y, rep_x, 1)
+    )[:sh, :sw]
+
+    mid_noise = np.tile(
+        GLOBAL_MID_NOISE,
+        (rep_y, rep_x, 1)
+    )[:sh, :sw]
+
+    bright_noise = np.tile(
+        GLOBAL_BRIGHT_NOISE,
+        (rep_y, rep_x, 1)
+    )[:sh, :sw]
+
+    dark_mask = np.clip(
+        (0.5 - lum) * 2.0,
+        0,
+        1
+    )[:, :, None]
+
+    bright_mask = np.clip(
+        (lum - 0.5) * 2.0,
+        0,
+        1
+    )[:, :, None]
+
+    mid_mask = (
+        1.0 -
+        dark_mask -
+        bright_mask
+    )
+
+    noise = (
+        dark_noise * dark_mask +
+        mid_noise * mid_mask +
+        bright_noise * bright_mask
+    )
 
     small += noise * 255 * cfg.grain_strength
 
@@ -290,14 +453,19 @@ def process_chroma(cr, cb, cfg):
     up = cv2.resize(
         small,
         (w, h),
-        interpolation=cv2.INTER_LANCZOS4
+        interpolation=cv2.INTER_LINEAR
     )
 
     up += 128.0
 
-    up = np.clip(up, 0, 255).astype(np.uint8)
+    up = np.clip(
+        up,
+        0,
+        255
+    ).astype(np.uint8)
 
     cr_out = up[:, :, 0]
+
     cb_out = np.roll(
         up[:, :, 1],
         cfg.chroma_roll_shift,
@@ -305,84 +473,6 @@ def process_chroma(cr, cb, cfg):
     )
 
     return cr_out, cb_out
-
-
-def dither_blend(a, b, cfg):
-
-    h, w = a.shape[:2]
-
-    bayer4 = np.array([
-        [0,  8,  2, 10],
-        [12, 4, 14,  6],
-        [3, 11,  1,  9],
-        [15, 7, 13,  5]
-    ], dtype=np.float32) / 16.0
-
-    tiled = np.tile(
-        bayer4,
-        (h // 4 + 1, w // 4 + 1)
-    )[:h, :w]
-
-    mask = (tiled < cfg.dither_amount).astype(np.uint8)
-    mask3 = mask[:, :, None]
-
-    return np.where(mask3 == 1, b, a)
-
-
-def split_tiles(img, cfg):
-
-    h, w = img.shape[:2]
-
-    tile_h = h // cfg.tiles_y
-    tile_w = w // cfg.tiles_x
-
-    overlap = cfg.tile_overlap
-
-    tiles = []
-
-    for ty in range(cfg.tiles_y):
-        for tx in range(cfg.tiles_x):
-
-            y0 = ty * tile_h
-            x0 = tx * tile_w
-
-            y1 = (
-                (ty + 1) * tile_h
-                if ty < cfg.tiles_y - 1
-                else h
-            )
-
-            x1 = (
-                (tx + 1) * tile_w
-                if tx < cfg.tiles_x - 1
-                else w
-            )
-
-            sy0 = max(0, y0 - overlap)
-            sx0 = max(0, x0 - overlap)
-
-            sy1 = min(h, y1 + overlap)
-            sx1 = min(w, x1 + overlap)
-
-            tile = img[sy0:sy1, sx0:sx1]
-
-            tiles.append((
-                y0, y1, x0, x1,
-                sy0, sy1, sx0, sx1,
-                tile
-            ))
-
-    return tiles
-
-
-def merge_tiles(base_img, processed_tiles):
-
-    out = base_img.copy()
-
-    for y0, y1, x0, x1, tile in processed_tiles:
-        out[y0:y1, x0:x1] = tile
-
-    return out
 
 
 def selective_sepia(img, cfg):
@@ -401,22 +491,30 @@ def selective_sepia(img, cfg):
         (Cb - 128.0) ** 2
     )
 
-    max_dist = np.sqrt(128.0 ** 2 + 128.0 ** 2)
+    max_dist = np.sqrt(
+        128.0**2 +
+        128.0**2
+    )
 
-    t = np.clip(dist / max_dist, 0.0, 1.0)
+    t = np.clip(
+        dist / max_dist,
+        0.0,
+        1.0
+    )
 
     chroma_mask = np.sin(np.pi * t)
 
     lum = Y / 255.0
+
     lum_mask = np.sin(np.pi * lum)
 
-    mask = (
+    mask = np.clip(
         chroma_mask *
         lum_mask *
-        cfg.sepia_strength
+        cfg.sepia_strength,
+        0.0,
+        1.0
     )
-
-    mask = np.clip(mask, 0.0, 1.0)
 
     B, G, R = cv2.split(src)
 
@@ -440,71 +538,45 @@ def selective_sepia(img, cfg):
 
     sepia = cv2.merge([sepB, sepG, sepR])
 
-    mask3 = cv2.merge([mask, mask, mask])
+    mask3 = mask[:, :, None]
 
-    out = src * (1.0 - mask3) + sepia * mask3
-
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def process_tile(tile, cfg):
-
-    (
-        y0, y1, x0, x1,
-        sy0, sy1, sx0, sx1,
-        img
-    ) = tile
-
-    y, cr, cb = split_ycc(img)
-
-    cr_p, cb_p = process_chroma(cr, cb, cfg)
-
-    y_sharp = rcas_like_sharpen(y, cfg)
-
-    merged = merge_ycc(y_sharp, cr_p, cb_p)
-
-    sepia_merged = selective_sepia(merged, cfg)
-
-    final_tile = dither_blend(
-        merged,
-        sepia_merged,
-        cfg
+    out = (
+        src * (1.0 - mask3) +
+        sepia * mask3
     )
 
-    crop_top = y0 - sy0
-    crop_left = x0 - sx0
-
-    crop_bottom = crop_top + (y1 - y0)
-    crop_right = crop_left + (x1 - x0)
-
-    final_tile = final_tile[
-        crop_top:crop_bottom,
-        crop_left:crop_right
-    ]
-
-    return (y0, y1, x0, x1, final_tile)
+    return np.clip(
+        out,
+        0,
+        255
+    ).astype(np.uint8)
 
 
-POOL: Optional[Pool] = None
+def dither_blend(a, b, cfg):
 
+    h, w = a.shape[:2]
 
-def init_pool(processes):
+    mask = GLOBAL_DITHER[:h, :w]
 
-    global POOL
+    mask3 = mask[:, :, None]
 
-    POOL = Pool(processes)
+    return np.where(mask3 == 1, b, a)
 
 
 def process_image(args, cfg):
 
     filename, idx = args
 
-    path = os.path.join(INPUT_FOLDER, filename)
+    start_time = time.perf_counter()
+
+    path = os.path.join(
+        INPUT_FOLDER,
+        filename
+    )
 
     img = cv2.imread(path)
 
     if img is None:
-        print(f"Failed to load: {filename}")
         return None
 
     h, w = img.shape[:2]
@@ -524,21 +596,32 @@ def process_image(args, cfg):
         generate_bloom_layer(img, cfg)
     )
 
-    tiles = split_tiles(img, cfg)
+    y, cr, cb = split_ycc(img)
 
-    processed_tiles = POOL.starmap(
-        process_tile,
-        [(t, cfg) for t in tiles]
+    cr_p, cb_p = process_chroma(cr, cb, cfg)
+
+    y_sharp = rcas_like_sharpen(y, cfg)
+
+    merged = merge_ycc(
+        y_sharp,
+        cr_p,
+        cb_p
     )
 
-    final = merge_tiles(img, processed_tiles)
+    sepia_merged = selective_sepia(
+        merged,
+        cfg
+    )
 
-    final = apply_chromatic_aberration(final, cfg)
+    final = dither_blend(
+        merged,
+        sepia_merged,
+        cfg
+    )
 
-    final = cv2.GaussianBlur(
+    final = apply_chromatic_aberration(
         final,
-        (3, 3),
-        0.5
+        cfg
     )
 
     out_name = f"photo{idx+1:03d}.jpg"
@@ -556,19 +639,24 @@ def process_image(args, cfg):
             cfg.jpeg_quality,
 
             int(cv2.IMWRITE_JPEG_PROGRESSIVE),
-            1,
+            0,
 
             int(cv2.IMWRITE_JPEG_OPTIMIZE),
-            1
+            0
         ]
     )
 
-    return filename
+    elapsed = time.perf_counter() - start_time
+
+    return elapsed
 
 
 if __name__ == "__main__":
 
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    os.makedirs(
+        OUTPUT_FOLDER,
+        exist_ok=True
+    )
 
     filenames = sorted([
         f for f in os.listdir(INPUT_FOLDER)
@@ -577,48 +665,39 @@ if __name__ == "__main__":
 
     total = len(filenames)
 
+    init_noise(CFG)
+    init_dither()
     init_pool(4)
 
-    image_times = []
+    print(f"Processing {total} images...\n")
 
-    print(f"[{' ' * total}] 0/{total}", end="", flush=True)
-
-    cache_counter = 0
-
-    for i, fn in enumerate(filenames):
-
-        start_time = time.perf_counter()
-
-        process_image((fn, i), CFG)
-
-        elapsed = time.perf_counter() - start_time
-
-        image_times.append(elapsed)
-
-        cache_counter += 1
-
-        if cache_counter % 4 == 0:
-            _CA_CACHE.clear()
-
-        bar = ("." * (i + 1)).ljust(total)
-
-        print(
-            f"\r[{bar}] {i+1}/{total} | {elapsed:.2f}s/img",
-            end="",
-            flush=True
-        )
+    image_times = POOL.starmap(
+        process_image,
+        [
+            ((fn, i), CFG)
+            for i, fn in enumerate(filenames)
+        ]
+    )
 
     POOL.close()
     POOL.join()
 
-    print(f"\nProcessed {total} images.")
+    image_times = [
+        t for t in image_times
+        if t is not None
+    ]
+
+    print(f"Processed {len(image_times)} images.")
 
     if image_times:
 
         fastest = min(image_times)
         slowest = max(image_times)
 
-        average = sum(image_times) / len(image_times)
+        average = (
+            sum(image_times) /
+            len(image_times)
+        )
 
         sorted_times = sorted(image_times)
 
