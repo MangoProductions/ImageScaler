@@ -56,7 +56,7 @@ Brightness-dependent grain response using Poisson-distributed noise.
 Low-resolution chroma manipulation inspired by analog compression artifacts.
 
 ### Selective Sepia
-Adaptive sepia blending based on luminance and chroma intensity.
+Adaptive sepia blending based on luminance and chroma intensity. In Musical Terms can be visualized as an inversion of a Bandpass filter: Instead of the Peak of the filter being in the middle it is around the middle value, with Sepia only affecting values that are not in the center or to the extremes.
 
 ## Future goals
 Will continue debloating this code. It currently has a few redundancies that did not help with speeding it up, specifically the attempt at generating noise values once and reusing them. 
